@@ -1,15 +1,17 @@
 //! SQLite 数据库模块。
 //!
-//! 这里集中负责三件事：
+//! 本模块 **只** 负责数据库相关的职责：
 //! 1. 计算数据库文件的位置；
 //! 2. 创建 SQLx SQLite 连接池；
 //! 3. 应用启动时执行 `init.sql`，确保表和索引已经存在。
 //!
 //! 业务 command 不需要重复打开数据库，只需要通过
 //! `tauri::State<'_, Database>` 取得这里创建好的连接池即可。
+//!
+//! 上游 API 适配器（OpenAI、DeepSeek 等）已移至独立的 `adaptor` 模块，
+//! 与数据库层解耦。
 
-// 让 db 模块对外暴露数据模型和 repository。
-// lib.rs 可以通过 `db::models` 和 `db::repository` 使用它们。
+// 对外暴露数据模型和 repository，供 command 层使用。
 pub mod models;
 pub mod repository;
 
@@ -40,7 +42,7 @@ impl Database {
     pub async fn new(app: &AppHandle) -> Result<Self, String> {
         // 获取应用专属的数据目录。
         // 例如 macOS 通常位于 ~/Library/Application Support/<bundle-id>。
-        let app_data_dir = app //pathBuf就是是 Rust 里专门用来表示“文件路径”的
+        let app_data_dir = app
             .path()
             .app_data_dir()
             .map_err(|error| format!("failed to get app data dir: {error}"))?;
@@ -48,9 +50,7 @@ impl Database {
         // 第一次启动时目录可能还不存在，因此需要递归创建目录。
         // 目录已经存在时，create_dir_all 不会报错。
         std::fs::create_dir_all(&app_data_dir)
-            .map_err(|error| format!("failed to create app data dir: {error}"))?; //只处理 Result 里的 Err，把错误类型转换成另一种错误类型
-
-        //std::fs 是 Rust 标准库里专门负责文件系统操作的模块。
+            .map_err(|error| format!("failed to create app data dir: {error}"))?;
 
         // join 会根据当前操作系统生成正确的路径分隔符。
         // SQLite 文件不存在时，后面的 create_if_missing(true) 会创建它。
@@ -61,7 +61,7 @@ impl Database {
         // 需要 URL 编码的字符。
         let options = SqliteConnectOptions::new()
             .filename(&db_path)
-            .create_if_missing(true); //如果文件不存在，就自动创建，如果存在就直接使用
+            .create_if_missing(true);
 
         // 创建连接池。
         // max_connections(5) 表示最多同时保留 5 条 SQLite 连接；对于桌面端

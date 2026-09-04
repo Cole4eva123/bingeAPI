@@ -7,13 +7,27 @@
 //! - Tauri command 只负责取 State、调用 repository、返回结果。
 
 use serde::Serialize;
-use sqlx::{query, query_as, QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{query, query_as, QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
 use super::models::{now_iso, ApiKey, Channel, CreateChannelInput, RequestLog, UpdateChannelInput};
 
 /// repository 层统一返回字符串错误，方便直接作为 Tauri command 的错误返回值。
 pub type RepositoryResult<T> = Result<T, String>;
+
+/// 查询 channels 表的总记录数。
+///
+/// 主要用于前端仪表盘展示或验证数据库连接是否正常。
+pub async fn count_channels(pool: &SqlitePool) -> RepositoryResult<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS count FROM channels")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("failed to count channels: {error}"))?;
+
+    // 根据 SQL 中的别名 "count" 读取第一行的 count 列。
+    row.try_get("count")
+        .map_err(|error| format!("failed to read count: {error}"))
+}
 
 /// channels 查询需要的列。
 ///
@@ -180,6 +194,34 @@ pub async fn delete_channel(pool: &SqlitePool, id: &str) -> RepositoryResult<()>
         .execute(pool)
         .await
         .map_err(|error| format!("failed to delete channel: {error}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err(format!("channel not found: {id}"));
+    }
+
+    Ok(())
+}
+
+/// 保存渠道最近一次连通性测试的时间和结果。
+pub async fn update_channel_test_result(
+    pool: &SqlitePool,
+    id: &str,
+    success: bool,
+) -> RepositoryResult<()> {
+    let result = query(
+        r#"
+        UPDATE channels
+        SET last_test_at = ?, last_test_ok = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now_iso())
+    // SQLite 没有独立布尔类型：1 表示成功，0 表示失败。
+    .bind(if success { 1_i64 } else { 0_i64 })
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("failed to update channel test result: {error}"))?;
 
     if result.rows_affected() == 0 {
         return Err(format!("channel not found: {id}"));
