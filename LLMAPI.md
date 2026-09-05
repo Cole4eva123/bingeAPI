@@ -359,6 +359,244 @@ let response = client.get(url).send().await?;
 
 流式响应不要先调用 `.text()` 或 `.json()`，应保留 `Response`，再用 `.bytes_stream()` 逐块读取。
 
+### DeepSeek 流式返回格式与 SSE
+
+本项目对 DeepSeek 发出的流式请求仍是普通 HTTP POST，只是在 JSON 请求体中加入：
+
+```json
+{
+  "model": "DeepSeek-V4-Pro-0813",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请依次输出1到5，每个数字之间用空格分隔。"
+    }
+  ],
+  "stream": true
+}
+```
+
+真实测试返回：
+
+```text
+Status: 200 OK
+Content-Type: text/event-stream
+```
+
+- `200 OK`：地址、API Key、模型和请求格式均被上游接受。
+- `text/event-stream`：响应体采用 SSE 流，而不是一次性 JSON。
+
+#### 什么是 SSE
+
+SSE 全称 Server-Sent Events，作用是在一个保持打开的 HTTP 响应中，让服务端不断向客户端发送事件。
+
+```text
+客户端发送一次 HTTP 请求
+        ↓
+服务端保持响应连接
+        ↓
+data: 第一条事件
+
+data: 第二条事件
+
+data: 第三条事件
+        ↓
+服务端发送结束标志并关闭响应
+```
+
+SSE 是服务端到客户端的单向数据流；WebSocket 则支持双方持续互发消息。LLM 生成内容只需要服务端持续推送，因此 SSE 很合适。
+
+标准 SSE 事件可以包含：
+
+```text
+event: message
+id: 123
+retry: 3000
+data: 第一行数据
+data: 第二行数据
+
+```
+
+- `event`：事件类型，省略时通常按普通 `message` 处理。
+- `id`：SSE 事件 ID，用于断线重连；它不等同于 JSON 中的请求 `id`。
+- `retry`：建议客户端等待多少毫秒后重连。
+- `data`：事件数据；可以有多行，多行数据用换行连接。
+- 空行：表示当前事件结束。
+- 以 `:` 开头的行：注释或心跳，不是业务数据。
+
+DeepSeek 的 OpenAI 兼容接口在本次测试中只使用了 `data:`。
+
+#### 推理内容事件
+
+流开始后，模型先返回推理增量：
+
+```text
+data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"我们需要"}}]}
+
+data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"回答"}}]}
+```
+
+主要字段：
+
+- `id`：本次模型请求的 ID；同一次回答的各事件通常使用相同 ID。
+- `object`：`chat.completion.chunk` 表示它是回答的一小段增量。
+- `created`：上游生成的 Unix 时间戳。
+- `model`：实际上游模型。
+- `choices[0].index`：第几个候选回答，通常为 `0`。
+- `delta`：本次事件新增的内容，不是截至当前的完整内容。
+- `delta.reasoning_content`：推理内容增量。
+- `delta.content`：展示给用户的最终回答增量。
+
+推理阶段通常表现为：
+
+```text
+reasoning_content 有内容
+content           为空字符串
+```
+
+如果产品只展示最终答案，就不要把 `reasoning_content` 拼进 `content`；需要展示推理时，应分别保存和展示。
+
+#### 最终回答事件
+
+推理完成后，`content` 开始逐步返回：
+
+```text
+data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"1"}}]}
+
+data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":" "}}]}
+
+data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"2"}}]}
+```
+
+客户端按事件顺序拼接所有非空 `delta.content`：
+
+```text
+"1" + " " + "2" + " " + "3" + " " + "4" + " " + "5"
+                              ↓
+                         "1 2 3 4 5"
+```
+
+不要假设一次事件一定返回一个完整汉字、单词或句子；一次增量可能只有一个字符，也可能包含多个字符。
+
+#### 正常结束与 Token 用量
+
+模型完成生成时，本次测试收到：
+
+```json
+{
+  "id": "<request-id>",
+  "object": "chat.completion.chunk",
+  "created": 1788546113,
+  "model": "DeepSeek-V4-Pro-0813",
+  "choices": [
+    {
+      "index": 0,
+      "delta": {
+        "role": "assistant",
+        "content": ""
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 97,
+    "completion_tokens": 52,
+    "total_tokens": 149,
+    "completion_tokens_details": {
+      "reasoning_tokens": 42
+    }
+  }
+}
+```
+
+- `finish_reason: "stop"`：模型正常完成回答。
+- `prompt_tokens`：输入消耗的 Token。
+- `completion_tokens`：输出消耗的 Token，可能包含推理 Token。
+- `reasoning_tokens`：推理部分消耗的 Token。
+- `total_tokens`：总消耗，本次为 `97 + 52 = 149`。
+
+本次上游还额外发送了一条只有 usage、没有 choices 的事件：
+
+```json
+{
+  "choices": [],
+  "usage": {
+    "prompt_tokens": 97,
+    "completion_tokens": 52,
+    "total_tokens": 149
+  }
+}
+```
+
+因此记录用量时不要把多次出现的 usage 累加。可以用最新的非空 usage 覆盖旧值，最终保存一次。
+
+最后一条数据是：
+
+```text
+data: [DONE]
+```
+
+`[DONE]` 不是 JSON，也不是 SSE 标准规定的特殊值，而是 OpenAI 兼容接口约定的流结束标志。收到后应停止解析本次回答并完成收尾。
+
+#### 网络 chunk 不等于 SSE 事件
+
+`reqwest` 的：
+
+```rust
+response.chunk().await
+```
+
+读取的是网络字节块，不是完整 SSE 事件。二者边界没有固定关系：
+
+```text
+一个网络 chunk 可能包含多条 SSE 事件
+一条 SSE 事件也可能被拆进多个网络 chunk
+一个 UTF-8 汉字的字节也可能跨越两个 chunk
+```
+
+因此不能假设每次 `chunk()` 都能直接去掉 `data:` 后解析 JSON。
+
+- 只做代理转发：可以将收到的原始字节立即转发，不必解析。
+- 需要解析内容：先把字节加入缓冲区，再按 SSE 空行边界拆出完整事件，最后解析 `data:`。
+- 解析器应同时考虑 `\n\n` 和 `\r\n\r\n` 行结束格式。
+- 不要对每个原始 chunk 单独做 UTF-8 解码；应等完整数据边界或使用增量 UTF-8 解码器。
+
+本项目的真实测试使用：
+
+```rust
+while let Some(chunk) = response.chunk().await? {
+    std::io::stdout().write_all(&chunk)?;
+}
+```
+
+它只是把原始字节写到终端，所以适合观察响应；如果以后需要提取 `content`、`reasoning_content` 和 `usage`，还需要增加 SSE 缓冲与解析逻辑。
+
+#### 接收 DeepSeek SSE 的处理顺序
+
+```text
+检查 HTTP 状态码
+    ↓ 非 2xx：读取普通错误响应
+确认 Content-Type 是 text/event-stream
+    ↓
+持续读取网络 chunk，并加入缓冲区
+    ↓
+从缓冲区拆出完整 SSE 事件
+    ↓
+忽略空行、注释和心跳
+    ↓
+data: [DONE] → 正常结束
+    ↓ 其他 data
+解析 JSON
+    ├─ reasoning_content → 单独累计推理内容
+    ├─ content → 累计最终回答
+    ├─ finish_reason → 记录结束原因
+    └─ usage → 覆盖保存最新用量
+```
+
+如果连接在收到 `[DONE]` 前意外断开，应视为不完整响应，不能仅凭已经收到部分文本就判断请求完整成功。
+
+浏览器原生 `EventSource` 主要用于 GET；Chat Completions 使用 POST，所以通常使用 `fetch()` 读取响应流，或由 Rust 后端使用 `reqwest` 接收并转发。
+
 ## Rust插件
 
 ### rust-analyzer
