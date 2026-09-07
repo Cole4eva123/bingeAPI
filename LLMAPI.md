@@ -1,802 +1,899 @@
-> 我的要求：精炼易懂。
+# LLMAPI · bingeAPI 项目说明
 
-# LLMAPI
+本文件是项目主文档，兼作阅读源码时的 Rust 速查笔记。内容以当前代码和迁移脚本为准。
 
+阅读顺序：先看 Rust 基础，再看项目分层和调用流程，最后查接口与数据库字段。
 
+- [Rust 阅读指南](#rust-阅读指南)
+- [项目概况与目录](#项目概况与目录)
+- [程序逻辑与调用流程](#程序逻辑与调用流程)
+- [前后端接口](#前后端接口)
+- [适配器与流式响应](#适配器与流式响应)
+- [数据库结构](#数据库结构)
+- [开发与测试](#开发与测试)
 
-```
-rustup
- ├── rustc      Rust 编译器
- ├── cargo      Rust 包管理器 / 构建工具
- ├── rustfmt    格式化  //自动把你的 Rust 代码整理成官方推荐的统一格式。
- └── clippy     代码检查
-```
+## Rust 阅读指南
 
-## Rust语法
+### 1. 工具各做什么
 
-函数最后一个没有 `;` 的表达式，就是返回值。
+| 工具 | 用途 |
+| --- | --- |
+| `rustup` | 安装和管理 Rust 工具链 |
+| `rustc` | 编译 Rust |
+| `cargo` | 管理依赖、构建、运行和测试 |
+| `rustfmt` | 格式化源码，通过 `cargo fmt` 使用 |
+| `clippy` | 检查代码问题，通过 `cargo clippy` 使用 |
 
-### 数组
+编辑器中，`rust-analyzer` 提供补全、类型提示、跳转和诊断；TOML 扩展用于编辑 `Cargo.toml`。Tauri 是桌面应用框架，Tauri 插件用于扩展系统能力，与编辑器扩展不同。
 
-```rust
-let blank1 = [0; 3]; //就是创建了一个有三个值的数组，每个值都是0
-```
-
-
-
-### 引用
-
-  - T：拿走所有权
-  - &T：只读借用
-  - &mut T：可修改借用
-
-### `&str` 与 `String`
-
-字符串字面量看起来像字符串，但类型是 `&'static str`：
+### 2. 变量、集合与返回值
 
 ```rust
-"example-key" // 类型：&'static str
-```
+let count = 3;                 // 默认不可重新赋值
+let mut total = 0;             // mut 允许修改
+total += count;
 
-- `&str`：借用的字符串切片，不拥有内容；字符串字面量在程序运行期间一直有效。
-- `String`：拥有字符串内容，声明为 `mut` 后可以修改和增长。
+let fixed = [0; 3];           // 固定长度数组：[0, 0, 0]
+let mut models = vec!["a"];   // Vec：可增长的集合
+models.push("b");
 
-如果结构体字段要求 `String`：
-
-```rust
-pub api_key: String,
-```
-
-赋值时需要把 `&str` 转成 `String`：
-
-```rust
-api_key: "example-key".to_string(),
-```
-
-```text
-&str → String
-```
-
-下面三种写法效果相同：
-
-```rust
-"example-key".to_string()
-String::from("example-key")
-"example-key".into() // 根据目标类型推断为 String
-```
-
-记忆：`&str` 是借用，`String` 是拥有。
-
-### `Some` 与 `Option<T>`
-
-`Some` 表示“这里有一个值”。它不是单独使用的类型，而是 `Option<T>` 的一种状态。
-
-Rust 中的 `Option<T>` 可以简化理解为：
-
-```rust
-enum Option<T> {
-    Some(T), // 有值，值的类型是 T
-    None,    // 没有值
+fn add(a: i32, b: i32) -> i32 {
+    a + b                    // 末尾无分号的表达式作为返回值
 }
 ```
 
-例如一个端口号可能存在，也可能不存在：
+`[T; N]` 是固定长度数组，`Vec<T>` 是动态集合，`&[T]` 是借用一段连续元素的切片。提前返回时写 `return value;`；函数返回 `()` 表示没有有用的返回数据。
+
+### 3. 所有权、借用与字符串
+
+| 写法 | 含义 | 项目中的例子 |
+| --- | --- | --- |
+| `T` | 按值传递；通常移动所有权，`Copy` 类型会复制 | 接收 `CreateChannelInput` 后取出字段 |
+| `&T` | 只读借用 | `&SqlitePool`、`&ChannelConfig` |
+| `&mut T` | 可修改的借用 | 修改请求体中的 JSON 对象 |
+| `String` | 拥有文本内容 | 保存渠道名称、密钥 |
+| `&str` | 借用文本片段 | 函数接收渠道 ID 或模型名 |
+| `&'static str` | 整个程序运行期间有效的文本引用 | 供应商名称、错误代码 |
 
 ```rust
-let port1: Option<u16> = Some(8080); // 有端口号
-let port2: Option<u16> = None;       // 没有端口号
+let name = String::from("OpenAI");
+let borrowed: &str = &name;   // 借用，name 仍然有效
+let copied = name.clone();   // 复制文本，得到独立 String
+let moved = name;            // 移动；之后不能再使用 name
 ```
 
-可以把 `Option<T>` 想成一个盒子：
+字符串字面量 `"openai"` 的类型是 `&'static str`。转为 `String` 可用 `.to_string()`、`String::from(...)` 或在目标类型明确时用 `.into()`。
 
-```text
-Some(8080) = 盒子里装着 8080
-None       = 空盒子
-```
+`clone()` 的开销由类型决定：`String` 会复制内容；本项目的 `reqwest::Client::clone()` 共享内部连接池。
 
-因此 `Some(8080)` 的类型不是 `u16`，而是 `Option<u16>`。
+### 4. Option：可能没有值
 
-#### 为什么需要 `Option<T>`
-
-Rust 没有普通的 `null`。当一个值可能不存在时，必须明确写成 `Option<T>`，调用者也必须处理“有值”和“没有值”两种情况。
+`Option<T>` 只有两种状态：`Some(value)` 有值，`None` 无值。`Some(18)` 的类型是 `Option<i32>`，不是 `i32`。
 
 ```rust
-fn find_name(id: u64) -> Option<String> {
-    if id == 1 {
-        Some("Alice".to_string())
-    } else {
-        None
-    }
+let name: Option<String> = Some("demo".into());
+
+match name {
+    Some(value) => println!("{value}"),
+    None => println!("没有名称"),
 }
 ```
 
-#### `Some(value)`：把值装进去
+只处理有值的情况时，用 `if let`：
 
 ```rust
-let age = Some(18);
-```
-
-这里的 `Some(18)` 是构造一个 `Option<i32>`，把 `18` 放进去。
-
-#### `Some(value)`：把值取出来
-
-使用 `match` 同时处理两种情况：
-
-```rust
-match find_name(1) {
-    Some(name) => println!("找到：{name}"),
-    None => println!("没有找到"),
+if let Some(name) = &input.name {
+    non_empty("name", name)?;
 }
 ```
 
-这里的 `Some(name)` 是模式匹配：如果盒子里有值，就把值取出来并命名为 `name`。
+这里的 `&input.name` 避免移动字段；`name` 是模式匹配取出的引用，类型为 `&String`。
 
-只关心有值时，可以使用 `if let`：
+| 方法 | 用途 |
+| --- | --- |
+| `map(f)` | 有值时转换，结果仍包在 `Option` 中 |
+| `and_then(f)` | 有值时继续一个返回 `Option` 的操作，避免嵌套 |
+| `unwrap_or(value)` | 无值时使用默认值；默认表达式会先求值 |
+| `unwrap_or_else(f)` | 无值时才调用闭包计算默认值 |
+| `ok_or_else(f)` | 把 `Option<T>` 转成 `Result<T, E>` |
+| `as_ref()` | 把 `Option<T>` 借用为 `Option<&T>` |
+| `as_deref()` | 例如把 `Option<String>` 借用为 `Option<&str>` |
+| `transpose()` | 把 `Option<Result<T, E>>` 转为 `Result<Option<T>, E>` |
+
+项目中的链式写法：
 
 ```rust
-if let Some(name) = find_name(1) {
-    println!("找到：{name}");
+if let Some(bytes) = request.body().and_then(|body| body.as_bytes()) {
+    println!("{}", String::from_utf8_lossy(bytes));
 }
 ```
 
-如果结果是 `None`，大括号里的代码不会执行。
+含义：先检查有没有请求体，再检查能否直接取得字节；两步都有值才打印。流式请求体不一定能直接取得内存字节。
 
-#### 项目代码逐层拆解
+### 5. Result 与问号：处理失败
 
-```rust
-if let Some(body) = request.body().and_then(|body| body.as_bytes()) {
-    println!("Body: {}", String::from_utf8_lossy(body));
-}
-```
-
-第一步：取得请求体。
+`Option` 表示“有没有”，`Result<T, E>` 表示“成功还是失败”：
 
 ```rust
-request.body() // Option<&reqwest::Body>
+Ok(value)   // 成功，携带数据
+Err(error)  // 失败，携带原因
 ```
 
-- `Some(&Body)`：请求中有 body。
-- `None`：请求中没有 body。
-
-第二步：尝试把 body 读取成内存中的字节。
+在返回 `Result` 的函数中，`?` 遇到 `Ok` 取出值，遇到 `Err` 提前返回；需要时通过 `From` 转换错误类型。
 
 ```rust
-body.as_bytes() // Option<&[u8]>
+let channel = repository::find_channel(pool, id)
+    .await?
+    .ok_or_else(|| AppError::NotFound(id.to_owned()))?;
 ```
 
-- `Some(&[u8])`：body 可以直接作为字节读取。
-- `None`：例如 body 是无法直接读取的流式数据。
+这两次 `?` 分别处理：数据库查询失败，以及查询成功但渠道不存在。
 
-第三步：`and_then` 把两次判断串起来。
+`Option` 和 `Result` 本身也能组合：
 
-```rust
-request.body().and_then(|body| body.as_bytes())
-```
+| 查询结果 | 含义 |
+| --- | --- |
+| `Ok(Some(channel))` | 查询成功，找到渠道 |
+| `Ok(None)` | 查询成功，没有该渠道 |
+| `Err(error)` | 查询过程失败 |
 
-等价逻辑：
+在返回 `Option` 的函数中，`?` 遇到 `None` 会提前返回 `None`。
 
-```rust
-match request.body() {
-    Some(body) => body.as_bytes(),
-    None => None,
-}
-```
+`unwrap()` 和 `expect("说明")` 遇到无值或错误会触发 panic。项目主要在测试断言和无法继续启动的最终入口使用它们。
 
-只有 `request.body()` 是 `Some` 时，闭包 `|body| body.as_bytes()` 才会执行。最终结果是 `Option<&[u8]>`。
+### 6. 闭包与迭代器
 
-第四步：`if let Some(body)` 取出字节。
-
-```rust
-if let Some(body) = 最终结果 {
-    // body 的类型是 &[u8]
-}
-```
-
-整句话就是：如果请求体存在，并且能直接读取成字节，就取出这些字节并打印；否则什么也不做。
-
-#### 常用方法
-
-```rust
-value.unwrap()              // 取出值；None 时程序崩溃
-value.expect("必须有值")    // 取出值；None 时带消息崩溃
-value.unwrap_or(默认值)     // None 时使用默认值
-value.map(|v| 处理v)        // 有值才处理，并重新装进 Some
-value.and_then(|v| 返回Option) // 有值才继续下一次可能失败的操作
-```
-
-业务代码中不要随意使用 `unwrap()`；优先使用 `match`、`if let`、`unwrap_or` 或 `?`。
-
-在返回值也是 `Option` 的函数中，`?` 表示“遇到 `None` 就立即返回 `None`”：
-
-```rust
-fn first_char(name: Option<&str>) -> Option<char> {
-    let name = name?;
-    name.chars().next()
-}
-```
-
-#### `Option` 和 `Result` 的区别
-
-```text
-Option<T>    Some(value) / None       只表示有值或没值
-Result<T, E> Ok(value)   / Err(error) 表示成功或失败，并能携带错误原因
-```
-
-一句话记忆：`Some(value)` 就是“这个可能不存在的值，现在确实存在”。
-
-### |
-
-最常见的是 **闭包参数** 和 **按位或**。
+闭包是可以直接传给其他函数的小函数：`|参数| 表达式`。`||` 表示没有参数。
 
 ```rust
 let add = |a, b| a + b;
+let weight = input.weight.unwrap_or_else(|| 1);
 
-println!("{}", add(1, 2));
+let names: Vec<String> = channels
+    .into_iter()
+    .map(|channel| channel.info.name)
+    .collect();
 ```
 
-### #[derive(Debug)] and Display
+- `iter()` 借用元素；`into_iter()` 在这里消费集合，取得元素所有权。
+- `map` 转换每一项；`filter` 保留满足条件的项；`collect` 收集结果。
+- `|` 在闭包外也可能是按位或，或模式匹配中的“或”，例如 `matches!(status, 0 | 1)`。
 
-有了这个之后才可以
+### 7. struct、impl、trait 与 Box
 
 ```rust
-println!("{:?}", state);
+struct Channel {
+    name: String,
+}
+
+impl Channel {
+    fn new(name: String) -> Self { Self { name } } // 关联函数
+    fn name(&self) -> &str { &self.name }          // 方法
+}
+
+let channel = Channel::new("demo".into());
+println!("{}", channel.name());
 ```
 
-{:?}
- ↓
-Debug
- ↓
-程序员看
+`Self` 表示当前实现的类型。`Channel::new(...)` 不需要现成实例；`channel.name()` 带有 `self` 接收者，等价于这里的 `Channel::name(&channel)`。
 
-{}
- ↓
-Display
- ↓
-用户看
-
-### 方法
+`trait` 定义一组能力，类型通过 `impl Trait for Type` 实现它：
 
 ```rust
-Struct::funcName(&实例) ≈ 实例.funcName()
-```
+trait Summary {
+    fn summarize(&self) -> String;
+}
 
-### 使用特征作为函数参数
+fn notify(item: &impl Summary) {
+    println!("{}", item.summarize());
+}
 
-```rust
-pub fn notify(item: &impl Summary) {
-    println!("Breaking news! {}", item.summarize());
+// 对这个单参数例子，下面是等价的泛型写法。
+fn notify_generic<T: Summary>(item: &T) {
+    println!("{}", item.summarize());
 }
 ```
 
-```rust
-pub fn notify<T: Summary>(item: &T) {
-    println!("Breaking news! {}", item.summarize());
+项目使用 `Box<dyn Adapter>`：
 
-```
+- `Box<T>` 拥有堆上的值；`Box::new(10)` 把整数放入 Box。
+- `dyn Adapter` 表示实现了 `Adapter` 的某种类型，调用时通过动态分派选择方法。
+- `Box<dyn Adapter>` 让上层使用统一类型，不依赖具体适配器结构。
 
-### Box
+当前 OpenAI、DeepSeek 都由 `OpenAiCompatible` 配合不同预设实现；以后遇到不同协议，可新增另一种 `Adapter` 实现。
 
-`Box<T>`：把值 `T` 放到堆上，`Box` 保存它的地址并拥有它。
+### 8. mod、use 与可见性
 
-```rust
-let number = Box::new(10);
-```
+| 写法 | 含义 |
+| --- | --- |
+| `mod channel;` | 声明子模块，通常对应 `channel.rs` 或 `channel/mod.rs` |
+| `use crate::models::channel::Channel;` | 从当前 crate 根路径引入类型 |
+| `use super::now_iso;` | 从父模块引入 |
+| `use crate::db::channel as repository;` | 给模块取本地别名，没有创建新模块 |
+| `pub` | 对外可见，但仍受父模块可见性限制 |
+| `pub(crate)` | 当前 crate 内可见 |
+| `pub(super)` | 父模块范围内可见 |
+| `pub use channel::*;` | 重新导出子模块中的公开项 |
 
-```text
-number（固定大小的指针）→ 堆上的 10
-```
+一个 crate 是 Rust 的编译单元。本项目的 `src-tauri` package 同时包含二进制入口 `main.rs` 和库入口 `lib.rs`。
 
-本项目使用的是 `Box<dyn Adaptor>`：
+### 9. derive、Debug 与序列化
 
-```rust
-pub fn get_adaptor(channel_type: &str) -> anyhow::Result<Box<dyn Adaptor>> {
-    match channel_type {
-        "openai" => Ok(Box::new(OpenAiAdapter::new())),
-        _ => Err(anyhow::anyhow!("不支持的渠道类型")),
-    }
-}
-```
+`#[...]` 是属性；`#[derive(...)]` 自动生成常见 trait 的实现。
 
-- `dyn Adaptor`：某个实现了 `Adaptor` 的对象，具体类型可以运行时再确定。
-- `Box`：提供固定大小的指针，因此函数可以统一返回不同大小的适配器。
-- 调用 `adaptor.forward(...)` 时，Rust 会自动找到内部真实类型的方法。
+| 派生项 | 作用 |
+| --- | --- |
+| `Debug` | 支持 `{:?}` 调试输出 |
+| `Clone` | 支持 `.clone()` |
+| `Default` | 提供默认值 |
+| `Serialize` | 把 Rust 值转换为可序列化数据 |
+| `Deserialize` | 从 JSON 等数据构造 Rust 值 |
+| `sqlx::FromRow` | 从数据库行读取结构体字段 |
 
-以后可以统一返回不同供应商：
+`{}` 使用 `Display`，适合可读文本；`{:?}` 使用 `Debug`，适合检查结构。派生 `Debug` 不会自动获得 `Display`。
 
-```rust
-"openai" => Box::new(OpenAiAdapter::new()),
-"claude" => Box::new(ClaudeAdapter::new()),
-```
+`#[serde(rename = "type")]` 控制 JSON 字段名；`#[sqlx(rename = "type")]` 控制数据库列名。本项目 Rust 字段叫 `channel_type`，JSON 和 SQL 中仍叫 `type`。
 
-一句话：`Box<dyn Adaptor>` 把不同的适配器装进同一种“盒子”，让上层只依赖统一的 `Adaptor` 接口。
+### 10. JSON、async 与 HTTP
 
-###   pub body: serde_json::Value
-
-  只保证 body 是合法 JSON，不保证它一定是这种对象：
-
-  {
-    "messages": [],
-    "model": "..."
-  }
-
-### Rust 用 reqwest 发 HTTP 请求
-
-项目使用 `reqwest::Client`：
+`serde_json::Value` 能表示对象、数组、字符串、数字、布尔值或 null，因此“是 JSON”不代表“是对象”。
 
 ```rust
-let client = reqwest::Client::new();
+let mut body = serde_json::json!({"model": "demo"});
+let object = body.as_object_mut().expect("这里明确创建了对象");
+object.insert("stream".into(), serde_json::Value::Bool(true));
+```
 
+`async fn` 返回 Future，运行时负责推进执行；`.await` 等待异步操作完成，不等于自动创建新线程。项目由 Tauri 的异步运行时执行数据库与 HTTP 操作。
+
+```rust
 let response = client
-    .post(url)                    // 创建 POST 请求
-    .bearer_auth(api_key)         // 添加 Authorization: Bearer ...
-    .json(&body)                  // JSON 请求体；自动设置 Content-Type
-    .send()                       // 真正发送请求
-    .await?;                      // 异步等待响应
+    .post(url)
+    .bearer_auth(api_key) // Authorization: Bearer ...
+    .json(&body)         // 序列化 JSON，设置 Content-Type
+    .send()
+    .await?;
+
+let status = response.status(); // 先读取状态
+let text = response.text().await?; // 消费响应并读取完整 body
 ```
 
-读取响应：
+`send().await` 得到响应时，不代表整个响应体已经读完。`text()`、`json()` 会消费响应；流式处理应保留 Response，再调用 `chunk().await` 逐块读取。
 
-```rust
-let status = response.status();
-let body = response.text().await?;
+`#[async_trait]` 帮助本项目通过 `dyn Adapter` 调用异步 trait 方法。`Adapter: Send + Sync` 要求实现可安全跨线程转移并共享引用；`State<'_, AppState>` 则表示本次 command 借用 Tauri 管理的共享状态。
+
+## 项目概况与目录
+
+bingeAPI 是 Tauri 桌面应用：React + TypeScript 构建界面，Rust 处理业务，SQLite 保存数据，reqwest 请求上游 LLM API。
+
+| 功能 | 当前状态 |
+| --- | --- |
+| 渠道增删改查、计数、连通性测试 | 已注册为 Tauri command |
+| OpenAI 兼容的普通转发、流式转发 | 已实现适配器方法，尚未接入代理服务入口 |
+| 按启用状态查客户端密钥、搜索日志 | 已实现数据库函数，尚未注册 command |
+| 渠道管理页面 | 尚未实现，前端仍是 greet 示例 |
+| 客户端鉴权、额度/过期检查、选路、重试、请求日志写入 | 尚未实现完整业务流程 |
+| SSE 内容解析、流式用量统计、安全审计 | 尚未实现 |
+
+### 目录与职责
+
+```text
+bingeAPI/
+├── LLMAPI.md                       项目主文档
+├── package.json / bun.lock         前端脚本与依赖
+├── vite.config.ts / tsconfig*.json 前端构建与类型检查
+├── src/
+│   ├── main.tsx                    React 挂载入口
+│   ├── App.tsx                     当前示例页面，调用 greet
+│   └── App.css                     页面样式
+└── src-tauri/
+    ├── Cargo.toml / Cargo.lock     Rust 依赖
+    ├── tauri.conf.json             窗口、应用标识、开发与打包配置
+    ├── capabilities/default.json  主窗口插件权限
+    ├── build.rs                    Tauri 构建、监听迁移文件变化
+    ├── migrations/0001_initial.sql 数据库初始版本
+    └── src/
+        ├── main.rs                 调用 bingeapi_lib::run()
+        ├── lib.rs                  初始化、组装 AppState、注册 command
+        ├── error.rs                AppError 与前端错误转换
+        ├── models/channel.rs       渠道业务类型和输入输出
+        ├── commands/channel.rs     前端 IPC 入口
+        ├── services/
+        │   ├── channel.rs          校验、渠道测试、保存测试结果
+        │   └── channel/tests.rs    业务测试
+        ├── db/
+        │   ├── mod.rs              数据库连接、迁移、时间函数
+        │   ├── channel.rs          渠道 SQL 与 JSON 存储转换
+        │   ├── api_key.rs          启用密钥查询
+        │   ├── request_log.rs      日志查询、筛选与分页
+        │   ├── tests.rs            数据库测试
+        │   └── fixtures/legacy.sql 旧版表结构，仅供迁移测试
+        └── adapter/
+            ├── mod.rs              Adapter 接口、共享类型、工厂
+            ├── presets.rs          供应商配置与测试策略
+            ├── openai_compatible.rs 公共 Chat Completions 实现
+            └── tests.rs            请求构造、HTTP、SSE 测试
 ```
 
-GET 请求：
+Rust 子目录中的 `mod.rs` 负责声明或导出模块。旧目录 `adaptor/` 已统一为 `adapter/`；原 `db/repository.rs` 按业务拆分，原根目录 `init.sql` 已迁入 `migrations/`。
 
-```rust
-let response = client.get(url).send().await?;
+| 模块 | 应该负责 | 不应承担 |
+| --- | --- | --- |
+| `lib.rs` | 创建资源、注册入口 | 具体业务规则 |
+| `commands` | 接收参数、调用函数、返回错误 | SQL、HTTP 协议细节 |
+| `services` | 校验输入、协调多个步骤 | Tauri 窗口和状态管理 |
+| `db` | SQL、存储转换、数据库迁移 | 请求上游 |
+| `adapter` | 上游认证、请求和响应协议 | 查询数据库 |
+| `models` | 表达业务数据与接口结构 | 依赖 Tauri、SQLx |
+
+`repository` 是“数据访问层”的称呼；当前代码里的 `use crate::db::channel as repository` 只是给渠道数据库模块取别名。
+
+### 渠道为什么有几种类型
+
+| 类型 | 所在位置 | 用途 |
+| --- | --- | --- |
+| `CreateChannelInput` / `UpdateChannelInput` | `models/channel.rs` | 接收创建和部分更新参数 |
+| `ChannelRow` | `db/channel.rs`，私有 | 对应 SQLite 行，JSON 字段是 String |
+| `Channel` | `models/channel.rs` | 后端业务数据，包含 `info` 和真实 `api_key` |
+| `ChannelInfo` | `models/channel.rs` | 返回前端，结构化 JSON + `has_api_key` |
+| `ChannelConfig` | `adapter/mod.rs` | 适配器所需的地址、密钥、模型和配置 |
+
+```text
+SQLite 行 → ChannelRow → Channel
+                          ├─ info → ChannelInfo → 前端
+                          └─ 连接相关字段 → ChannelConfig → 上游
 ```
 
-常用方法：
+JSON 文本在数据库边界解析一次。command 不需要自己调用 `serde_json::from_str`；适配器也不需要认识数据库字段。
 
-- `.get()` / `.post()`：选择请求方式。
-- `.header()`：添加请求头。
-- `.bearer_auth()`：添加 Bearer API Key。
-- `.json()`：序列化 JSON，并自动设置 `Content-Type: application/json`。
-- `.send().await`：发送请求并等待响应。
-- `.status()`：取得 HTTP 状态码。
-- `.text().await` / `.json().await`：读取响应体；读取后会消费 `response`。
+## 程序逻辑与调用流程
 
-流式响应不要先调用 `.text()` 或 `.json()`，应保留 `Response`，再用 `.bytes_stream()` 逐块读取。
+### 1. 应用启动
 
-### DeepSeek 流式返回格式与 SSE
+代码入口：[lib.rs](src-tauri/src/lib.rs)。
 
-本项目对 DeepSeek 发出的流式请求仍是普通 HTTP POST，只是在 JSON 请求体中加入：
+```text
+main.rs → lib.rs::run()
+            ↓
+注册 opener 插件
+            ↓
+取得应用数据目录并创建目录
+            ↓
+Database::open(path)：创建连接池、执行数据库迁移
+            ↓
+创建共享 reqwest::Client
+            ↓
+app.manage(AppState { database, http_client })
+            ↓
+注册 command，运行桌面应用
+```
+
+数据库和 Client 都在启动时创建。command 通过 `tauri::State<'_, AppState>` 借用这些资源，避免每次打开数据库、重新创建 HTTP 连接池。
+
+数据库初始化是异步的，Tauri 的 `setup` 闭包是同步的，所以入口用 `tauri::async_runtime::block_on` 等初始化完成。数据库不可用时会中止启动。
+
+### 2. 前端调用与查询
+
+```text
+React invoke("list_channels")
+    → commands::list_channels
+    → db::channel::list_channels
+    → SQL 查询、ChannelRow 转换
+    → 提取 ChannelInfo
+    → 序列化后返回 React
+```
+
+`invoke` 是前端与 Rust 之间的 IPC 调用，不是请求某个 HTTP 路由。函数需要有 `#[tauri::command]`，并在 `lib.rs` 的 `generate_handler!` 中注册。
+
+计数、查询、删除直接调用数据库函数；创建、更新和测试需要业务处理，经过 service。简单查询不增加只有转发作用的中间层。
+
+### 3. 创建与部分更新
+
+创建：前端参数 → service 校验 → 后端生成 UUID/时间 → JSON 序列化 → INSERT → 查回完整渠道 → 返回 ChannelInfo。
+
+更新：前端参数 → 校验已传字段 → UPDATE → 查回渠道 → 返回 ChannelInfo。
+
+数据库使用：
+
+```sql
+name = COALESCE(?, name)
+```
+
+参数不是 SQL NULL 就写入新值，否则保留旧列。这样可以只改名称，不必把完整记录重新传一遍。更新时会刷新 `updated_at`；不存在的 ID 返回错误。
+
+### 4. 渠道连通性测试
+
+实现：[services/channel.rs](src-tauri/src/services/channel.rs)。
+
+```text
+test_channel(id)
+    → 查渠道，解析存储配置
+    → 按渠道类型选择 Adapter
+    → 构造 ChannelConfig
+    → adapter.test(config)
+    → 更新 last_test_at / last_test_ok
+    → 返回 TestResult 或内部错误
+```
+
+结果分为三类：
+
+| 情况 | 返回 | 最近测试状态 |
+| --- | --- | --- |
+| 上游返回成功状态 | `success: true` | 记录为 1 |
+| 无法连接或上游拒绝 | `success: false`，附带原因 | 记录为 0 |
+| 调用 `adapter.test` 返回内部错误 | `Err` | 尝试记录为 0 后返回错误 |
+
+查不到渠道、存储 JSON 无法解析或类型不受支持时，在调用适配器之前就返回错误；这些情况不会写入测试结果。保存结果本身失败时，command 返回数据库错误。
+
+当前 `latency_ms` 主要测量到收到响应头的耗时，不代表完整回答生成时间；OpenAI 的测试成功也不代表所有聊天模型都可用。
+
+### 5. 完整代理流程的后续方向
+
+以下是待接入流程，当前还不能直接对外提供完整代理服务：
+
+```text
+客户端携带本项目的 API Key
+    → 鉴权、检查模型权限/额度/有效期
+    → 选择渠道
+    → 调用 adapter.forward 或 forward_stream
+    → 将响应返回客户端
+    → 写 request_logs、更新额度
+```
+
+当前已有“查启用密钥”“上游转发”“查日志”等部件，尚未完成这条调用链。数据库有某个字段，不等于已经实现了对应规则。
+
+## 前后端接口
+
+实现：[commands/channel.rs](src-tauri/src/commands/channel.rs)。
+
+### command 清单
+
+| command | invoke 参数 | 成功返回 |
+| --- | --- | --- |
+| `greet` | `{ name }` | 问候字符串 |
+| `count_channels` | 无 | 全部渠道数量 |
+| `list_channels` | 无 | `ChannelInfo[]`，按 priority 降序、created_at 降序 |
+| `get_channel` | `{ id }` | `ChannelInfo`，不存在时为 null |
+| `create_channel` | `{ input }` | 新建的 `ChannelInfo` |
+| `update_channel` | `{ input }` | 更新后的 `ChannelInfo` |
+| `delete_channel` | `{ id }` | true；不存在时报错 |
+| `test_channel` | `{ id }` | `{ success, message, latency_ms }` |
+
+列表包含启用和禁用渠道；当前手动测试也不会因为 `status = 0` 自动跳过。
+
+### 创建和更新参数
+
+创建必填：`name`、`type`、`base_url`、`api_key`、`models`。
+
+创建可选：`priority` 默认 0，`weight` 默认 1，`config`、`model_mapping` 默认空对象。`status` 由后端固定初始化为 1。
+
+更新必填 `id`；其余可更新字段都是可选的，另支持 `status`。
+
+| 规则 | 当前行为 |
+| --- | --- |
+| name、api_key | 不允许空字符串或全空白 |
+| type | 只支持 `openai`、`deepseek` |
+| base_url | 必须是带主机的绝对 HTTP(S) URL，填写 API 根地址 |
+| models | 字符串数组，可以为空；已有元素不能是空白 |
+| model_mapping | 字符串到字符串的对象 |
+| config | JSON 对象，内部值可为任意 JSON |
+| weight | 正整数 |
+| status | 更新时只接受 0 或 1 |
+| priority | 整数，当前没有范围限制 |
+
+更新语义：
+
+| 输入 | 含义 |
+| --- | --- |
+| 字段省略或传 null | 保留旧值 |
+| `models: []` | 清空模型列表 |
+| `config: {}` / `model_mapping: {}` | 清空对应配置 |
+| 传入部分 config 对象 | 替换整个对象，不会与旧对象合并 |
+| 省略 api_key | 保留原密钥；不能用空字符串清空 |
+
+### 调用示例
+
+在 Tauri 窗口中执行；浏览器单独打开 Vite 页面不具备完整的 Tauri 调用环境。
+
+```ts
+import { invoke } from "@tauri-apps/api/core";
+
+const channel = await invoke<{ id: string }>("create_channel", {
+  input: {
+    name: "My channel",
+    type: "openai",
+    base_url: "https://api.openai.com/v1",
+    api_key: "YOUR_API_KEY", // 示例占位，创建时替换为实际值
+    models: ["gpt-4o"],
+    model_mapping: {},
+    config: {},
+  },
+});
+
+await invoke("update_channel", {
+  input: { id: channel.id, name: "Renamed" },
+});
+
+const result = await invoke<{
+  success: boolean;
+  message: string;
+  latency_ms: number;
+}>("test_channel", { id: channel.id });
+```
+
+渠道返回值节选：
 
 ```json
 {
-  "model": "DeepSeek-V4-Pro-0813",
-  "messages": [
-    {
-      "role": "user",
-      "content": "请依次输出1到5，每个数字之间用空格分隔。"
-    }
-  ],
-  "stream": true
+  "id": "<uuid>",
+  "name": "Renamed",
+  "type": "openai",
+  "has_api_key": true,
+  "models": ["gpt-4o"],
+  "config": {},
+  "model_mapping": {},
+  "last_test_ok": null
 }
 ```
 
-真实测试返回：
+完整返回还包含地址、状态、优先级、权重和时间字段，详见 [ChannelInfo](src-tauri/src/models/channel.rs)。JSON 字段已经是数组或对象，不要再对它们调用 `JSON.parse`；返回值不含真实 `api_key`。
 
-```text
-Status: 200 OK
-Content-Type: text/event-stream
-```
+### 错误返回
 
-- `200 OK`：地址、API Key、模型和请求格式均被上游接受。
-- `text/event-stream`：响应体采用 SSE 流，而不是一次性 JSON。
-
-#### 什么是 SSE
-
-SSE 全称 Server-Sent Events，作用是在一个保持打开的 HTTP 响应中，让服务端不断向客户端发送事件。
-
-```text
-客户端发送一次 HTTP 请求
-        ↓
-服务端保持响应连接
-        ↓
-data: 第一条事件
-
-data: 第二条事件
-
-data: 第三条事件
-        ↓
-服务端发送结束标志并关闭响应
-```
-
-SSE 是服务端到客户端的单向数据流；WebSocket 则支持双方持续互发消息。LLM 生成内容只需要服务端持续推送，因此 SSE 很合适。
-
-标准 SSE 事件可以包含：
-
-```text
-event: message
-id: 123
-retry: 3000
-data: 第一行数据
-data: 第二行数据
-
-```
-
-- `event`：事件类型，省略时通常按普通 `message` 处理。
-- `id`：SSE 事件 ID，用于断线重连；它不等同于 JSON 中的请求 `id`。
-- `retry`：建议客户端等待多少毫秒后重连。
-- `data`：事件数据；可以有多行，多行数据用换行连接。
-- 空行：表示当前事件结束。
-- 以 `:` 开头的行：注释或心跳，不是业务数据。
-
-DeepSeek 的 OpenAI 兼容接口在本次测试中只使用了 `data:`。
-
-#### 推理内容事件
-
-流开始后，模型先返回推理增量：
-
-```text
-data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"我们需要"}}]}
-
-data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"回答"}}]}
-```
-
-主要字段：
-
-- `id`：本次模型请求的 ID；同一次回答的各事件通常使用相同 ID。
-- `object`：`chat.completion.chunk` 表示它是回答的一小段增量。
-- `created`：上游生成的 Unix 时间戳。
-- `model`：实际上游模型。
-- `choices[0].index`：第几个候选回答，通常为 `0`。
-- `delta`：本次事件新增的内容，不是截至当前的完整内容。
-- `delta.reasoning_content`：推理内容增量。
-- `delta.content`：展示给用户的最终回答增量。
-
-推理阶段通常表现为：
-
-```text
-reasoning_content 有内容
-content           为空字符串
-```
-
-如果产品只展示最终答案，就不要把 `reasoning_content` 拼进 `content`；需要展示推理时，应分别保存和展示。
-
-#### 最终回答事件
-
-推理完成后，`content` 开始逐步返回：
-
-```text
-data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"1"}}]}
-
-data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":" "}}]}
-
-data: {"id":"<request-id>","object":"chat.completion.chunk","created":1788546113,"model":"DeepSeek-V4-Pro-0813","choices":[{"index":0,"delta":{"role":"assistant","content":"2"}}]}
-```
-
-客户端按事件顺序拼接所有非空 `delta.content`：
-
-```text
-"1" + " " + "2" + " " + "3" + " " + "4" + " " + "5"
-                              ↓
-                         "1 2 3 4 5"
-```
-
-不要假设一次事件一定返回一个完整汉字、单词或句子；一次增量可能只有一个字符，也可能包含多个字符。
-
-#### 正常结束与 Token 用量
-
-模型完成生成时，本次测试收到：
+内部保留 `AppError`，到 command 边界转换为：
 
 ```json
-{
-  "id": "<request-id>",
-  "object": "chat.completion.chunk",
-  "created": 1788546113,
-  "model": "DeepSeek-V4-Pro-0813",
-  "choices": [
-    {
-      "index": 0,
-      "delta": {
-        "role": "assistant",
-        "content": ""
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 97,
-    "completion_tokens": 52,
-    "total_tokens": 149,
-    "completion_tokens_details": {
-      "reasoning_tokens": 42
-    }
-  }
-}
+{ "code": "not_found", "message": "channel not found: missing-id" }
 ```
 
-- `finish_reason: "stop"`：模型正常完成回答。
-- `prompt_tokens`：输入消耗的 Token。
-- `completion_tokens`：输出消耗的 Token，可能包含推理 Token。
-- `reasoning_tokens`：推理部分消耗的 Token。
-- `total_tokens`：总消耗，本次为 `97 + 52 = 149`。
+| code | 原因 |
+| --- | --- |
+| `invalid_input` | 业务校验失败 |
+| `not_found` | 要操作的渠道不存在 |
+| `database_error` | SQL 执行、连接或读取失败 |
+| `migration_error` | 迁移失败，当前主要发生在启动时 |
+| `invalid_stored_data` | 数据库中某个 JSON 字段无法解析 |
+| `serialization_error` | JSON 序列化失败 |
+| `upstream_error` | 适配器内部或转发过程错误 |
 
-本次上游还额外发送了一条只有 usage、没有 choices 的事件：
+`invoke` 遇到 command 的 `Err` 会拒绝 Promise，应使用 `try/catch`。Tauri 自身的参数反序列化错误由框架处理，不能假设所有错误都有 `code`。
 
-```json
-{
-  "choices": [],
-  "usage": {
-    "prompt_tokens": 97,
-    "completion_tokens": 52,
-    "total_tokens": 149
-  }
-}
-```
+## 适配器与流式响应
 
-因此记录用量时不要把多次出现的 usage 累加。可以用最新的非空 usage 覆盖旧值，最终保存一次。
+实现：[adapter/mod.rs](src-tauri/src/adapter/mod.rs)、[openai_compatible.rs](src-tauri/src/adapter/openai_compatible.rs)。
 
-最后一条数据是：
+### 公共协议与供应商预设
+
+`get_adapter(type, &client)` 从 [presets.rs](src-tauri/src/adapter/presets.rs) 选预设，返回 `Box<dyn Adapter>`。当前两种渠道共用 URL 拼接、Bearer 认证、请求体构造、响应读取和用量解析。
+
+| 预设 | 项目保存的默认地址/模型 | 连通性测试 | 特殊处理 |
+| --- | --- | --- | --- |
+| openai | `https://api.openai.com/v1`；gpt-4o、gpt-4o-mini | GET /models | config.organization / project 转成相应请求头 |
+| deepseek | `https://api.edgefn.net/v1`；DeepSeekV4Pro | POST /chat/completions，max_tokens=1 | 默认别名映射到 DeepSeek-V4-Pro-0813 |
+
+这些是项目内置数据，不表示官方或实时模型清单。DeepSeek 地址是项目已有的第三方 edgefn 预设；实际请求始终使用数据库保存的 `base_url`。创建渠道仍需自己传地址和模型；当前没有自动填充预设的前端页面。
+
+模型映射顺序：用户 `model_mapping` → 供应商默认映射 → 原始模型名。DeepSeek 测试使用配置中的第一个模型；列表为空时使用预设模型。
+
+HTTP Client 在启动时创建，各适配器 clone 共享连接池。配置了 10 秒连接超时；未设置覆盖整个响应的总超时，因此不等于“请求最多运行 10 秒”。
+
+### 普通转发与流式转发
+
+| 方法 | 请求体处理 | 返回 |
+| --- | --- | --- |
+| `forward` | 映射 model，覆盖 `stream = false` | `ProxyResponse { status, body, usage }` |
+| `forward_stream` | 映射 model，覆盖 `stream = true` | 未消费的 `reqwest::Response` |
+
+`ProxyRequest` 只有 `model`、`body`；流式开关由调用的方法决定。body 必须为 JSON 对象，其余字段透传。
+
+普通转发遇到上游 4xx/5xx，仍返回状态码和响应数据，由调用方决定如何处理。非 JSON 响应保存为 `Value::String`。usage 缺失或所需字段不完整时返回 None，不能当作消耗为零。
+
+### SSE 需要理解的几个边界
+
+SSE 在一个持续打开的 HTTP 响应里发送事件，响应类型通常为 `text/event-stream`。Chat Completions 的流式调用仍是 POST 请求。
+
+下面是简化的协议示例，不是新的实测结果：
 
 ```text
+data: {"choices":[{"delta":{"reasoning_content":"先分析"}}]}
+
+data: {"choices":[{"delta":{"content":"1 2 3"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+
 data: [DONE]
+
 ```
 
-`[DONE]` 不是 JSON，也不是 SSE 标准规定的特殊值，而是 OpenAI 兼容接口约定的流结束标志。收到后应停止解析本次回答并完成收尾。
+| 字段/标志 | 含义与处理 |
+| --- | --- |
+| `delta.content` | 本次新增的回答文本，按顺序拼接 |
+| `delta.reasoning_content` | 某些上游的推理文本增量，和回答分别处理 |
+| `finish_reason` | 生成结束原因；仍可能有后续用量事件 |
+| `usage` | 用量快照；同一回答重复出现的累计用量不要反复相加 |
+| `data: [DONE]` | OpenAI 兼容协议的结束标志，不是 JSON，也不是 SSE 标准的特殊值 |
 
-#### 网络 chunk 不等于 SSE 事件
+不同上游的字段、事件顺序和 usage 行为可能不同；不能假设每个事件都有 `choices[0]` 或 content。
 
-`reqwest` 的：
+网络 chunk 不等于 SSE 事件：一个 chunk 可能包含多条事件，一条事件也可能跨多个 chunk，甚至一个 UTF-8 字符的字节也可能被拆开。
 
-```rust
-response.chunk().await
-```
-
-读取的是网络字节块，不是完整 SSE 事件。二者边界没有固定关系：
+如果只转发，直接转发原始字节。如果需要解析，应按以下顺序处理：
 
 ```text
-一个网络 chunk 可能包含多条 SSE 事件
-一条 SSE 事件也可能被拆进多个网络 chunk
-一个 UTF-8 汉字的字节也可能跨越两个 chunk
+检查状态码和 Content-Type
+    → 将字节加入缓冲区
+    → 按 SSE 行规则组装完整事件（空行结束事件）
+    → 合并多行 data，忽略注释/心跳
+    → 先识别 [DONE]，再解析普通 JSON
+    → 累计回答/推理内容，保存最新用量
 ```
 
-因此不能假设每次 `chunk()` 都能直接去掉 `data:` 后解析 JSON。
+实现解析器时要处理 LF、CRLF 等合法行结束形式，不要只对单个网络 chunk 做字符串替换和 JSON 解析。对于约定使用 `[DONE]` 的上游，提前断流需要作为不完整响应处理。
 
-- 只做代理转发：可以将收到的原始字节立即转发，不必解析。
-- 需要解析内容：先把字节加入缓冲区，再按 SSE 空行边界拆出完整事件，最后解析 `data:`。
-- 解析器应同时考虑 `\n\n` 和 `\r\n\r\n` 行结束格式。
-- 不要对每个原始 chunk 单独做 UTF-8 解码；应等完整数据边界或使用增量 UTF-8 解码器。
+标准 SSE 还可以有 `event`（类型）、`id`（重连标识）、`retry`（重连间隔）和以 `:` 开头的注释行。原生 EventSource 不适合直接发送这里的 POST 请求；前端可用 fetch 读流，后端可用 reqwest。
 
-本项目的真实测试使用：
+当前代码只保留并读取/转发原始响应，没有生产用的 SSE 事件解析器。真实测试中的 `response.chunk().await` 是把收到的字节写到终端，不会自动生成完整回答或统计流式用量。
 
-```rust
-while let Some(chunk) = response.chunk().await? {
-    std::io::stdout().write_all(&chunk)?;
+## 数据库结构
+
+结构来源：[0001_initial.sql](src-tauri/migrations/0001_initial.sql)。目前有三张业务表，另有 SQLx 自动管理的 `_sqlx_migrations`。
+
+### 存放位置与存储约定
+
+数据库文件名为 `bingeapi.db`，放在 Tauri 的应用数据目录，不在项目源码目录中。当前应用标识为 `com.da.bingeapi`；macOS 通常对应：
+
+```text
+~/Library/Application Support/com.da.bingeapi/bingeapi.db
+```
+
+实际路径以 `app.path().app_data_dir()` 的结果为准。连接池最多保留 5 条连接，按需复用；它不是每次查询都新建的单条连接。
+
+| 约定 | 当前实现 |
+| --- | --- |
+| ID | TEXT；创建渠道时由 Rust 生成 UUID v4 |
+| 时间 | 业务表用 TEXT；渠道写入 UTC ISO 8601，精确到毫秒 |
+| 布尔状态 | INTEGER，通常 0/1；Rust 部分字段仍用 i64 |
+| JSON | SQLite TEXT；写入前序列化，渠道读取时解析 |
+| 密钥 | 当前直接存为 TEXT；接口不返回渠道密钥，不等于数据库已经加密 |
+| 关联 | 使用 ID 字段表达，没有外键约束 |
+| 校验 | 主要在 service；表中没有 JSON、状态枚举或正权重的 CHECK 约束 |
+
+例如渠道时间：`2026-09-05T12:34:56.789Z`。统一格式后可按文本比较时间；混用时区或格式会影响筛选和排序。
+
+### channels：有哪些上游渠道
+
+| 字段 | 类型 | 约束/默认值 | 含义 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PRIMARY KEY | 渠道 ID，应用创建时生成 UUID |
+| `name` | TEXT | NOT NULL | 展示名称 |
+| `type` | TEXT | NOT NULL | 适配器类型，当前 openai / deepseek |
+| `base_url` | TEXT | NOT NULL | API 根地址，如 https://example.com/v1 |
+| `api_key` | TEXT | NOT NULL | 调用上游供应商的密钥 |
+| `models` | TEXT | NOT NULL，默认 '[]' | 模型名 JSON 数组 |
+| `status` | INTEGER | NOT NULL，默认 1 | 1 启用、0 禁用 |
+| `priority` | INTEGER | NOT NULL，默认 0 | 优先级；当前用于列表排序 |
+| `weight` | INTEGER | NOT NULL，默认 1 | 预留调度权重，尚未用于负载均衡 |
+| `config` | TEXT | NOT NULL，默认 '{}' | 供应商扩展配置 JSON 对象 |
+| `model_mapping` | TEXT | NOT NULL，默认 '{}' | 对外模型名到上游模型名的 JSON 映射 |
+| `created_at` | TEXT | NOT NULL | 创建时间 |
+| `updated_at` | TEXT | NOT NULL | 最近编辑时间 |
+| `last_test_at` | TEXT | 可空 | 最近一次测试时间；未测试为 NULL |
+| `last_test_ok` | INTEGER | 可空 | 测试成功 1、失败 0、未测试 NULL |
+
+数据库中的 `models` 内容是 JSON 文本，例如 `["alias"]`；业务代码中是 `Vec<String>`。映射示例：
+
+```json
+{
+  "model_mapping": {
+    "alias": "actual-upstream-model"
+  },
+  "config": {
+    "organization": "org-id",
+    "project": "project-id"
+  }
 }
 ```
 
-它只是把原始字节写到终端，所以适合观察响应；如果以后需要提取 `content`、`reasoning_content` 和 `usage`，还需要增加 SSE 缓冲与解析逻辑。
+配置里的 organization、project 目前仅由 OpenAI 预设转换为请求头。
 
-#### 接收 DeepSeek SSE 的处理顺序
+普通渠道编辑会更新 `updated_at`；保存测试结果只更新 `last_test_at` 和 `last_test_ok`，不会自动改变渠道启用状态或 `updated_at`。
+
+### api_keys：哪些客户端可以调用本项目
+
+这里的密钥是“客户端 → 本项目”的凭证，与 `channels.api_key` 的“本项目 → 上游供应商”凭证不同。
+
+| 字段 | 类型 | 约束/默认值 | 含义 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PRIMARY KEY | 记录 ID，用于关联 |
+| `name` | TEXT | NOT NULL | 给人看的密钥名称 |
+| `key` | TEXT | NOT NULL、UNIQUE | 客户端实际提交的密钥 |
+| `status` | INTEGER | NOT NULL，默认 1 | 当前查询只匹配值为 1 的记录 |
+| `allowed_models` | TEXT | NOT NULL，默认 '[]' | 预留允许模型的 JSON 数组 |
+| `allowed_channels` | TEXT | NOT NULL，默认 '[]' | 预留允许渠道的 JSON 数组 |
+| `quota_limit` | INTEGER | NOT NULL，默认 -1 | 预留总额度；-1 的业务语义尚未实现 |
+| `quota_used` | INTEGER | NOT NULL，默认 0 | 预留已用额度 |
+| `expires_at` | TEXT | 可空 | 预留过期时间 |
+| `created_at` | TEXT | NOT NULL | 创建时间 |
+| `updated_at` | TEXT | NOT NULL | 更新时间 |
+
+[get_api_key_by_key](src-tauri/src/db/api_key.rs) 目前仅执行“密钥相同且 status = 1”的查询，返回 `Option<ApiKey>`。它不会检查额度、过期时间或允许范围；空数组究竟表示“不限制”还是“不允许”，也尚未实现规则。
+
+目前 `ApiKey` 的 allowed_* 字段仍是数据库 JSON 字符串，没有像渠道一样转换成业务集合。创建密钥、扣减额度和前端管理接口尚未实现。
+
+### request_logs：每次请求发生了什么
+
+| 字段 | 类型 | 约束/默认值 | 含义 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PRIMARY KEY | 日志 ID |
+| `api_key_id` | TEXT | 可空 | 使用的客户端密钥记录 ID |
+| `api_key_name` | TEXT | 可空 | 请求发生时的密钥名称快照 |
+| `channel_id` | TEXT | 可空 | 实际使用的渠道 ID |
+| `channel_name` | TEXT | 可空 | 请求发生时的渠道名称快照 |
+| `model` | TEXT | NOT NULL | 客户端请求的模型名 |
+| `upstream_model` | TEXT | 可空 | 映射后发送给上游的模型名 |
+| `mode` | TEXT | NOT NULL | 请求模式，取值规则尚未统一 |
+| `status_code` | INTEGER | NOT NULL | 响应状态码 |
+| `prompt_tokens` | INTEGER | NOT NULL，默认 0 | 输入 Token 数 |
+| `completion_tokens` | INTEGER | NOT NULL，默认 0 | 输出 Token 数 |
+| `total_tokens` | INTEGER | NOT NULL，默认 0 | 总 Token 数 |
+| `duration_ms` | INTEGER | NOT NULL，默认 0 | 请求耗时，毫秒 |
+| `error_message` | TEXT | 可空 | 错误说明 |
+| `is_stream` | INTEGER | NOT NULL，默认 0 | 是否流式请求 |
+| `is_retry` | INTEGER | NOT NULL，默认 0 | 是否重试 |
+| `created_at` | TEXT | NOT NULL | 日志产生时间 |
+
+当前只实现查询，没有自动写入生产请求日志。表中也没有 `seq`、`request_body`、`risk_level` 等审计字段；Rust 模型已经与实际表结构对齐。
+
+表中的 Token 默认值 0 是存储默认值，不能用来推断上游是否报告过用量；将来接入日志写入时，需要定义“用量未知”的处理方式。
+
+### 表之间如何关联
 
 ```text
-检查 HTTP 状态码
-    ↓ 非 2xx：读取普通错误响应
-确认 Content-Type 是 text/event-stream
-    ↓
-持续读取网络 chunk，并加入缓冲区
-    ↓
-从缓冲区拆出完整 SSE 事件
-    ↓
-忽略空行、注释和心跳
-    ↓
-data: [DONE] → 正常结束
-    ↓ 其他 data
-解析 JSON
-    ├─ reasoning_content → 单独累计推理内容
-    ├─ content → 累计最终回答
-    ├─ finish_reason → 记录结束原因
-    └─ usage → 覆盖保存最新用量
+api_keys.id ──── request_logs.api_key_id
+channels.id ──── request_logs.channel_id
 ```
 
-如果连接在收到 `[DONE]` 前意外断开，应视为不完整响应，不能仅凭已经收到部分文本就判断请求完整成功。
+一个密钥或渠道可以对应多条日志。这些是逻辑关联，不是数据库外键：删除渠道不会级联删除日志，也不会自动清空日志里的 channel_id。
 
-浏览器原生 `EventSource` 主要用于 GET；Chat Completions 使用 POST，所以通常使用 `fetch()` 读取响应流，或由 Rust 后端使用 `reqwest` 接收并转发。
+名称快照用于保留请求发生时的名称；将来渠道或密钥改名，不需要改写历史日志。当前日志查询直接读取快照，没有 JOIN 渠道表。
 
-## Rust插件
+### 索引与日志查询
 
-### rust-analyzer
+| 索引 | 字段 | 对应用途 |
+| --- | --- | --- |
+| `idx_logs_created` | created_at | 时间筛选和排序 |
+| `idx_logs_channel` | channel_id | 按渠道 ID 查询 |
+| `idx_logs_api_key` | api_key_id | 按客户端密钥 ID 查询 |
+| `idx_logs_model` | model | 按模型查询 |
 
-```
-自动补全
-类型提示
-跳转定义
-重构
-错误检查
-Cargo 项目分析
-```
+主键和 `api_keys.key` 的唯一约束也由 SQLite 管理相应索引。当前日志函数按 channel_name 筛选，不是 channel_id；已有 ID 索引不等于会加速这个名称条件。
 
-### Tauri
+[search_logs](src-tauri/src/db/request_log.rs) 接收：
 
-你用 Tauri 写桌面应用时，前端通常是 HTML/CSS/JS/TS，但浏览器本身不能随便访问系统功能，比如文件系统、剪贴板、通知、系统托盘、打开外部链接等。Tauri 插件就是把这些 **系统级能力安全地暴露给前端调用**。
+- `LogFilter`：keyword、channel_name、model、date_from、date_to，全部可选。
+- `Pagination`：limit、offset；默认每页 50 条、偏移 0。
+- 返回 `Vec<RequestLog>`，没有总条数或总页数。
 
-### Even Better TOML
+keyword 模糊匹配密钥名称、渠道名称、模型、上游模型和错误消息；channel_name、model 为精确匹配。时间上下界分别使用 `>=` 和 `<=`。空白筛选值会被忽略。
 
-装上之后，VS Code 编辑 `.toml` 文件会更舒服，主要包括：
+结果按 created_at 降序排列，limit 被限制到 1–1000，offset 最小为 0。LIKE 参数通过绑定传入；其中的 `%`、`_` 仍有 SQL 通配符含义。
 
-- **语法高亮**
-- **自动补全**
-- **格式化 TOML**
-- **语法错误提示**
-- 对一些配置提供类型/Schema 检查
-- 鼠标悬停时显示部分字段信息
+### SQLx 在这里怎么用
 
+SQLx 负责异步执行、连接池、参数绑定和行映射。本项目使用 `query` / `query_as` 函数，SQL 主要在运行时检查；只有使用相应的 `query!` / `query_as!` 宏并配置检查环境，才有那类编译期 SQL 检查。
 
-
-```
-bun tauri dev
+```rust
+let row = sqlx::query_as::<_, ChannelRow>(&sql)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
 ```
 
-```
-启动前端开发服务器
-+
-编译 Rust / Tauri 后端
-+
-打开桌面 App 窗口
-+
-监听代码变化
-```
+| API | 用途 |
+| --- | --- |
+| `query(...).execute(...)` | INSERT / UPDATE / DELETE 等操作 |
+| `query_as::<_, T>(...)` | 将结果行映射为实现 FromRow 的 T |
+| `fetch_optional` | 零行得到 None，有行得到 Some |
+| `fetch_one` | 获取一行，没有行时报错 |
+| `fetch_all` | 获取所有匹配行 |
+| `bind` / `push_bind` | 绑定参数，避免把用户输入拼进 SQL |
+| `QueryBuilder` | 组合可选筛选条件 |
+| `rows_affected` | 判断更新/删除影响了多少行 |
 
-## 平时开发需要的命令
+渠道查询显式列出字段。`format!` 只拼接代码里的固定列名；用户传入的 ID、名称等通过参数绑定进入 SQL。
 
-前端单独开发：
+读取渠道的 JSON 转换为：
 
-```
-bun run dev
-```
-
-整个桌面程序：
-
-```
-bun tauri dev
+```text
+models        TEXT → Vec<String>
+config        TEXT → Map<String, Value>
+model_mapping TEXT → HashMap<String, String>
 ```
 
-安装 JS 包：
+存量 JSON 非法或结构不匹配时，返回带字段名的 `invalid_stored_data`，不静默替换成空配置。
 
-```
-bun add 包名
-```
+### 数据库迁移
 
-安装开发依赖：
+启动时由 `sqlx::migrate!("./migrations")` 内嵌并执行版本迁移，`build.rs` 监听该目录变化。
 
-```
-bun add -D 包名
-```
+| 场景 | 行为 |
+| --- | --- |
+| 新数据库 | 执行 0001，创建业务表和索引 |
+| 旧版 init.sql 创建的数据库 | 通过 IF NOT EXISTS 保留已有表和数据，登记初始版本 |
+| 重复启动 | 检查迁移记录，跳过已完成的版本 |
+| 新增字段或索引 | 增加新的迁移文件，例如 `0002_add_log_field.sql` |
 
-安装 Rust crate：
+`IF NOT EXISTS` 只避免重复创建，不会自动修复已有表的缺失字段。当前兼容的是仓库旧版结构；任意手工改过的数据库需要另行迁移。
 
-```
-cd src-tauri
-cargo add crate名
-```
+`_sqlx_migrations` 由 SQLx 管理，主要记录 version、description、installed_on、success、checksum 和 execution_time。它用于判断哪些版本已执行，以及迁移文件是否发生变化。
 
-检查 Rust：
+已经发布并执行的迁移文件应保持不变；升级通过新增文件完成。不要靠删除用户数据库实现升级。`db/fixtures/legacy.sql` 是测试基线，不参与正常启动。
 
-```
-cargo check
-```
+## 开发与测试
 
-Lint：
+### 日常命令
 
-```
-cargo clippy
-```
+以下命令均在项目根目录运行。
 
-格式化：
+| 目的 | 命令 |
+| --- | --- |
+| 安装前端依赖 | `bun install` |
+| 只启动前端开发服务器 | `bun run dev` |
+| 启动整个桌面应用 | `bun run tauri dev` |
+| 前端类型检查和生产构建 | `bun run build` |
+| Rust 编译检查 | `cargo check --manifest-path src-tauri/Cargo.toml` |
+| Rust 静态检查 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets` |
+| 格式化 Rust | `cargo fmt --manifest-path src-tauri/Cargo.toml` |
+| 只检查格式 | `cargo fmt --manifest-path src-tauri/Cargo.toml --check` |
+| 运行后端测试 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` |
+| 构建桌面安装包 | `bun run tauri build` |
+| 安装前端依赖 | `bun add 包名` |
+| 安装前端开发依赖 | `bun add -D 包名` |
+| 安装 Rust 依赖 | `cargo add --manifest-path src-tauri/Cargo.toml crate名` |
 
-```
-cargo fmt
-```
+依赖已缓存时，可给 `cargo check/test/clippy` 加 `--offline`。`Cargo.lock`、`bun.lock` 锁定依赖解析结果；提交依赖变更时一并保留。
 
-最后打包：
+`bun run tauri dev` 会按 tauri.conf.json 启动 Vite、编译 Rust、打开桌面窗口并监听变化。开发地址当前为 `http://localhost:1420`；打包时使用前端构建目录 `dist/`。
 
-```
-bun tauri build
-```
+### 测试分布
 
+| 文件 | 覆盖内容 |
+| --- | --- |
+| [adapter/tests.rs](src-tauri/src/adapter/tests.rs) | 模型映射、请求头、测试策略、普通 HTTP、SSE |
+| [services/channel/tests.rs](src-tauri/src/services/channel/tests.rs) | CRUD、部分更新、参数校验、错误类型、密钥隐藏、测试状态保存 |
+| [db/tests.rs](src-tauri/src/db/tests.rs) | 旧数据库迁移及重复打开、日志筛选、分页与参数绑定 |
 
+当前共 17 个测试，其中 16 个默认执行，1 个真实上游测试默认忽略。普通测试使用内存/临时 SQLite 和本机模拟 HTTP，不需要供应商密钥；HTTP 测试需要允许监听 `127.0.0.1`。
 
-## 数据库
+部分日志、密钥和转发方法尚未接入生产入口，因此普通编译可能出现未使用代码警告；不能把这些提示误认为功能已经接通。
 
-### sqlx
+### 手动运行真实 DeepSeek 流测试
 
-Rust 生态中操作 SQLite 的库主要有两个：
+在 zsh 中静默输入密钥：
 
-- **rusqlite：同步 API，简单直接，但在 async 环境中会阻塞线程**
-- **sqlx：异步 API，编译时检查 SQL，支持连接池，与 Tokio 深度集成**
-
-我们使用 `sqlx` + `runtime-tokio`，配合 `SqlitePoolOptions` 建立连接池。
-
-### 库表设计
-
-```
-用户拿 api_key 发请求
-        ↓
-api_keys 检查这个 key 能不能用
-        ↓
-根据模型、权限选择 channel
-        ↓
-channel 决定请求发到哪个上游 API
-        ↓
-调用 OpenAI / Anthropic / Gemini / 其他供应商
-        ↓
-把这次请求写进 request_logs
+```sh
+read -s "DEEPSEEK_API_KEY?请输入 DeepSeek API Key: "
+export DEEPSEEK_API_KEY
+cargo test --manifest-path src-tauri/Cargo.toml streams_live_response -- --ignored --nocapture
+unset DEEPSEEK_API_KEY
 ```
 
-三张表负责的东西：
+`read -s` 不回显输入，`export` 让 Cargo 和测试进程继承变量，Rust 用 `std::env::var` 读取；`unset` 清除当前 shell 中的变量。
 
-```
-channels
-→ “我有哪些上游 API 渠道？”
+可用 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL` 覆盖测试地址和模型。这个测试会真实联网并消耗额度，只检查上游成功、SSE 类型及收到 data，不验证回答语义。
 
-| 字段              | 含义                           |
-| --------------- | ---------------------------- |
-| `id`            | 渠道主键                         |
-| `name`          | 渠道名称                         |
-| `type`          | 渠道类型，例如 `openai`、`anthropic` |
-| `base_url`      | 上游 API 地址                    |
-| `api_key`       | 调用上游时使用的密钥                   |
-| `models`        | 这个渠道支持哪些模型                   |
-| `status`        | 渠道是否启用                       |
-| `priority`      | 调度优先级                        |
-| `weight`        | 同优先级情况下的负载均衡权重               |
-| `config`        | 额外配置                         |
-| `model_mapping` | 模型名称映射                       |
-| `created_at`    | 创建时间                         |
-| `updated_at`    | 更新时间                         |
-| `last_test_at`  | 最近一次测试渠道时间                   |
-| `last_test_ok`  | 最近测试是否成功                     |
+### 修改功能时从哪里开始
 
-api_keys
-→ “哪些用户/客户端可以调用我的服务？”
+| 要做的事 | 主要修改位置 |
+| --- | --- |
+| 增加渠道校验 | services/channel.rs，并补业务测试 |
+| 增加渠道字段 | 新迁移 → db/channel.rs → models/channel.rs → service/command |
+| 新增 OpenAI 兼容供应商 | adapter/presets.rs 的预设和选择分支，并补差异测试 |
+| 接入不同协议 | 新 Adapter 实现，并修改 get_adapter 工厂 |
+| 新增前端调用入口 | commands 中定义函数，在 lib.rs 注册 |
+| 接入代理服务 | 新业务入口协调鉴权、选路、adapter 和日志写入 |
+| 开发渠道页面 | 在 src 中按渠道功能组织组件、类型和 invoke 调用 |
 
-| 字段                 | 含义         |
-| ------------------ | ---------- |
-| `id`               | 主键         | --> 它主要是给数据库内部关联使用的。
-| `name`             | Key 名称     | --> 这是给人看的名字。
-| `key`              | 真正 API Key |
-| `status`           | 是否可使用      |
-| `allowed_models`   | 允许调用哪些模型   |
-| `allowed_channels` | 允许使用哪些渠道   |
-| `quota_limit`      | 总额度        |
-| `quota_used`       | 已使用额度      |
-| `expires_at`       | 过期时间       |
-| `created_at`       | 创建时间       |
-| `updated_at`       | 更新时间       |
-
-
-request_logs
-→ “每次请求实际发生了什么？”
-
-request_logs
-
-id = 10001
-
-api_key_id = 10
-api_key_name = development-key
-
-channel_id = 1 --＞　这次请求最后使用了哪个上游渠道
-channel_name = OpenAI Official
-
-model = gpt-5
-upstream_model = gpt-5-2026-08
-
-status_code = 200
-
-prompt_tokens = 1000
-completion_tokens = 500
-total_tokens = 1500
-
-duration_ms = 850
-
-error_message = NULL
-
-is_stream = false
-is_retry = false
-```
-
-整个数据表中我们用text类型存储json
+新增功能时沿现有职责放置代码：协议变化集中在 adapter，表结构变化通过迁移，业务规则集中在 service。阅读源码可从 `lib.rs → commands/channel.rs → services/channel.rs → db/adapter` 开始。
